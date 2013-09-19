@@ -138,12 +138,12 @@ context "Resque::Worker" do
     assert_equal now, @worker.processing['run_at']
   end
 
-  test "fails uncompleted jobs with DirtyExit by default on exit" do
+  test "fails uncompleted jobs with TermException by default on exit" do
     job = Resque::Job.new(:jobs, {'class' => 'GoodJob', 'args' => "blah"})
     @worker.working_on(job)
     @worker.unregister_worker
     assert_equal 1, Resque::Failure.count
-    assert_equal('Resque::DirtyExit', Resque::Failure.all['exception'])
+    assert_equal('Resque::TermException', Resque::Failure.all['exception'])
   end
 
   test "fails uncompleted jobs with worker exception on exit" do
@@ -169,7 +169,7 @@ context "Resque::Worker" do
     @worker.working_on(job)
     @worker.unregister_worker
     assert_equal 1, Resque::Failure.count
-    assert(SimpleJobWithFailureHandling.exception.kind_of?(Resque::DirtyExit))
+    assert(SimpleJobWithFailureHandling.exception.kind_of?(Resque::TermException))
   end
 
   class ::SimpleFailingJob
@@ -885,137 +885,89 @@ context "Resque::Worker" do
   end
 
   if !defined?(RUBY_ENGINE) || defined?(RUBY_ENGINE) && RUBY_ENGINE != "jruby"
-    test "old signal handling is the default" do
-      rescue_time = nil
+    [SignalException, Resque::TermException].each do |exception|
+      test "SIGTERM catching #{exception}" do
+        begin
+          eval("class LongRunningJob; @@exception = #{exception}; end")
+          class LongRunningJob
+            @queue = :long_running_job
 
-      begin
-        class LongRunningJob
-          @queue = :long_running_job
+            def self.perform( run_time )
+              Resque.redis.client.reconnect # get its own connection
+              Resque.redis.rpush( 'sigterm-test:start', Process.pid )
+              sleep run_time
+              Resque.redis.rpush( 'sigterm-test:result', 'Finished Normally' )
+            end
 
-          def self.perform( run_time, rescue_time=nil )
-            Resque.redis.client.reconnect # get its own connection
-            Resque.redis.rpush( 'sigterm-test:start', Process.pid )
-            sleep run_time
-            Resque.redis.rpush( 'sigterm-test:result', 'Finished Normally' )
-          rescue Resque::TermException => e
-            Resque.redis.rpush( 'sigterm-test:result', %Q(Caught SignalException: #{e.inspect}))
-            sleep rescue_time unless rescue_time.nil?
-          ensure
-            puts 'fuuuu'
-            Resque.redis.rpush( 'sigterm-test:final', 'exiting.' )
+            def self.on_failure_retry(e, *args)
+              Resque.redis.rpush( 'sigterm-test:result', %Q(Caught SignalException: #{e.inspect}))
+              Resque.redis.rpush( 'sigterm-test:final', 'exiting.' )
+            end
+
+            def self.after_perform
+              Resque.redis.rpush( 'sigterm-test:final', 'exiting.' )
+            end
           end
-        end
 
-        Resque.enqueue( LongRunningJob, 5, rescue_time )
+          Resque.enqueue(LongRunningJob, 5)
 
+<<<<<<< HEAD
         worker_pid = Kernel.fork do
           # reconnect since we just forked
           Resque.redis.client.reconnect
+=======
+          worker_pid = Kernel.fork do
+            # ensure we actually fork
+            $TESTING = false
+            # reconnect since we just forked
+            Resque.redis.client.reconnect
+>>>>>>> 826a253... Register and unregister signal handlers from within the perform method.
 
-          worker = Resque::Worker.new(:long_running_job)
+            worker = Resque::Worker.new(:long_running_job)
 
-          suppress_warnings do
             worker.work(0)
+            exit!
           end
-          exit!
-        end
 
-        # ensure the worker is started
-        start_status = Resque.redis.blpop( 'sigterm-test:start', 5 )
-        assert_not_nil start_status
-        child_pid = start_status[1].to_i
-        assert_operator child_pid, :>, 0
+          # ensure the worker is started
+          start_status = Resque.redis.blpop( 'sigterm-test:start', 5 )
+          assert_not_nil start_status
+          child_pid = start_status[1].to_i
+          assert_operator child_pid, :>, 0
 
-        # send signal to abort the worker
-        Process.kill('TERM', worker_pid)
-        Process.waitpid(worker_pid)
+          # send signal to abort the worker
+          Process.kill('TERM', worker_pid)
+          Process.waitpid(worker_pid)
 
-        # wait to see how it all came down
-        result = Resque.redis.blpop( 'sigterm-test:result', 5 )
-        assert_nil result
-
-        # ensure that the child pid is no longer running
-        child_not_running = `ps -p #{child_pid.to_s} -o pid=`.empty?
-        assert child_not_running
-      ensure
-        remaining_keys = Resque.redis.keys('sigterm-test:*') || []
-        Resque.redis.del(*remaining_keys) unless remaining_keys.empty?
-      end
-    end
-  end
-
-  if !defined?(RUBY_ENGINE) || defined?(RUBY_ENGINE) && RUBY_ENGINE != "jruby"
-    [SignalException, Resque::TermException].each do |exception|
-      {
-        'cleanup occurs in allotted time' => nil,
-        'cleanup takes too long' => 2
-      }.each do |scenario,rescue_time|
-        test "SIGTERM when #{scenario} while catching #{exception}" do
-          begin
-            eval("class LongRunningJob; @@exception = #{exception}; end")
-            class LongRunningJob
-              @queue = :long_running_job
-
-              def self.perform( run_time, rescue_time=nil )
-                Resque.redis.client.reconnect # get its own connection
-                Resque.redis.rpush( 'sigterm-test:start', Process.pid )
-                sleep run_time
-                Resque.redis.rpush( 'sigterm-test:result', 'Finished Normally' )
-              rescue @@exception => e
-                Resque.redis.rpush( 'sigterm-test:result', %Q(Caught SignalException: #{e.inspect}))
-                sleep rescue_time unless rescue_time.nil?
-              ensure
-                Resque.redis.rpush( 'sigterm-test:final', 'exiting.' )
-              end
-            end
-
-            Resque.enqueue( LongRunningJob, 5, rescue_time )
-
+<<<<<<< HEAD
             worker_pid = Kernel.fork do
               # reconnect since we just forked
               Resque.redis.client.reconnect
+=======
+          # wait to see how it all came down
+          result = Resque.redis.blpop( 'sigterm-test:result', 5 )
+          assert_not_nil result
+          assert !result[1].start_with?('Finished Normally'), 'Job Finished normally.'
+          assert result[1].start_with? 'Caught SignalException', 'Signal exception not raised in child.'
+>>>>>>> 826a253... Register and unregister signal handlers from within the perform method.
 
-              worker = Resque::Worker.new(:long_running_job)
-              worker.term_timeout = 1
-              worker.term_child = 1
+          # ensure that the child pid is no longer running
+          child_still_running = !(`ps -p #{child_pid.to_s} -o pid=`).empty?
+          assert !child_still_running
 
-              worker.work(0)
-              exit!
-            end
+          # see if post-cleanup occurred. This should be
+          post_cleanup_occurred = Resque.redis.lpop( 'sigterm-test:final' )
+          assert post_cleanup_occurred, 'post cleanup did not occur. SIGKILL sent too early?'
+          #assert !post_cleanup_occurred, 'post cleanup occurred. SIGKILL sent too late?' unless rescue_time.nil?
 
-            # ensure the worker is started
-            start_status = Resque.redis.blpop( 'sigterm-test:start', 5 )
-            assert_not_nil start_status
-            child_pid = start_status[1].to_i
-            assert_operator child_pid, :>, 0
-
-            # send signal to abort the worker
-            Process.kill('TERM', worker_pid)
-            Process.waitpid(worker_pid)
-
-            # wait to see how it all came down
-            result = Resque.redis.blpop( 'sigterm-test:result', 5 )
-            assert_not_nil result
-            assert !result[1].start_with?('Finished Normally'), 'Job Finished normally. Sleep not long enough?'
-            assert result[1].start_with? 'Caught SignalException', 'Signal exception not raised in child.'
-
-            # ensure that the child pid is no longer running
-            child_still_running = !(`ps -p #{child_pid.to_s} -o pid=`).empty?
-            assert !child_still_running
-
-            # see if post-cleanup occurred. This should happen IFF the rescue_time is less than the term_timeout
-            post_cleanup_occurred = Resque.redis.lpop( 'sigterm-test:final' )
-            assert post_cleanup_occurred, 'post cleanup did not occur. SIGKILL sent too early?' if rescue_time.nil?
-            assert !post_cleanup_occurred, 'post cleanup occurred. SIGKILL sent too late?' unless rescue_time.nil?
-
-          ensure
-            remaining_keys = Resque.redis.keys('sigterm-test:*') || []
-            Resque.redis.del(*remaining_keys) unless remaining_keys.empty?
-          end
+        ensure
+          remaining_keys = Resque.redis.keys('sigterm-test:*') || []
+          Resque.redis.del(*remaining_keys) unless remaining_keys.empty?
         end
       end
     end
 
+<<<<<<< HEAD
     test "exits with Resque::TermException when using TERM_CHILD and not forking" do
       begin
         class LongRunningJob
@@ -1098,6 +1050,8 @@ context "Resque::Worker" do
       assert !stderr.match(/^WARNING:/)
     end
 
+=======
+>>>>>>> 826a253... Register and unregister signal handlers from within the perform method.
     class SuicidalJob
       @queue = :jobs
 
@@ -1111,9 +1065,21 @@ context "Resque::Worker" do
     end
 
     test "will notify failure hooks when a job is killed by a signal" do
+<<<<<<< HEAD
       Resque.enqueue(SuicidalJob)
       suppress_warnings do
         @worker.work(0)
+=======
+      begin
+        $TESTING = false
+        Resque.enqueue(SuicidalJob)
+        suppress_warnings do
+          @worker.work(0)
+        end
+        assert_equal Resque::TermException, SuicidalJob.send(:class_variable_get, :@@failure_exception).class
+      ensure
+        $TESTING = true
+>>>>>>> 826a253... Register and unregister signal handlers from within the perform method.
       end
       assert_equal Resque::DirtyExit, SuicidalJob.send(:class_variable_get, :@@failure_exception).class
     end

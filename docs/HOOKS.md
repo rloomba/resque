@@ -96,7 +96,7 @@ The available hooks are:
   `Resque::Failure` backend.
 
 * `on_failure`: Called with the exception and job args if any exception occurs
-  while performing the job (or hooks), this includes Resque::DirtyExit.
+  while performing the job (or hooks), this includes Resque::TermException.
 
 Hooks are easily implemented with superclasses or modules. A superclass could
 look something like this.

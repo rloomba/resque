@@ -45,10 +45,9 @@ module Resque
       end
     end
 
-    attr_accessor :term_timeout
-
-    # decide whether to use new_kill_child logic
-    attr_accessor :term_child
+    # Boolean indicating whether this worker can or can not fork.
+    # Automatically set if a fork(2) fails.
+    attr_accessor :cant_fork
 
     # When set to true, forked workers will exit with `exit`, calling any `at_exit` code handlers that have been
     # registered in the application. Otherwise, forked workers exit with `exit!`
@@ -126,7 +125,8 @@ module Resque
     # removed without needing to restart workers using this method.
     def initialize(*queues)
       @queues = queues.map { |queue| queue.to_s.strip }
-      @shutdown = nil
+      @shutting_down = nil
+      @shutting_down_child = nil
       @paused = nil
       validate_queues
     end
@@ -163,7 +163,7 @@ module Resque
       startup
 
       loop do
-        break if shutdown?
+        break if shutting_down?
 
         if not paused? and job = reserve
           log "got: #{job.inspect}"
@@ -179,9 +179,9 @@ module Resque
             rescue SystemCallError
               nil
             end
-            job.fail(DirtyExit.new($?.to_s)) if $?.signaled?
+            job.fail(TermException.new($?.termsig)) if $?.signaled?
           else
-            unregister_signal_handlers if will_fork? && term_child
+            unregister_signal_handlers if will_fork?
             begin
 
               reconnect
@@ -336,7 +336,6 @@ module Resque
 
     # Runs all the methods needed when a worker begins its lifecycle.
     def startup
-      Kernel.warn "WARNING: This way of doing signal handling is now deprecated. Please see http://hone.heroku.com/resque/2012/08/21/resque-signals.html for more info." unless term_child or $TESTING
       enable_gc_optimizations
       register_signal_handlers
       prune_dead_workers
@@ -365,18 +364,14 @@ module Resque
     # USR2: Don't process any new jobs
     # CONT: Start processing jobs again after a USR2
     def register_signal_handlers
-      trap('TERM') { shutdown!  }
-      trap('INT')  { shutdown!  }
+      trap("TERM") { shutdown(true) }
+      trap("INT") { shutdown(true) }
 
       begin
-        trap('QUIT') { shutdown   }
-        if term_child
-          trap('USR1') { new_kill_child }
-        else
-          trap('USR1') { kill_child }
-        end
-        trap('USR2') { pause_processing }
-        trap('CONT') { unpause_processing }
+        trap("QUIT") { shutdown }
+        trap("USR1") { shutdown_child(true) }
+        trap("USR2") { pause_processing }
+        trap("CONT") { unpause_processing }
       rescue ArgumentError
         warn "Signals QUIT, USR1, USR2, and/or CONT not supported."
       end
@@ -385,27 +380,24 @@ module Resque
     end
 
     def unregister_signal_handlers
-      trap('TERM') do
-        trap ('TERM') do 
-          # ignore subsequent terms               
-        end  
-        raise TermException.new("SIGTERM") 
-      end 
-      trap('INT', 'DEFAULT')
+      trap("TERM", "DEFAULT")
+      trap("INT", "DEFAULT")
 
       begin
-        trap('QUIT', 'DEFAULT')
-        trap('USR1', 'DEFAULT')
-        trap('USR2', 'DEFAULT')
+        trap("QUIT", "DEFAULT")
+        trap("USR1", "DEFAULT")
+        trap("USR2", "DEFAULT")
       rescue ArgumentError
       end
     end
 
-    # Schedule this worker for shutdown. Will finish processing the
-    # current job.
-    def shutdown
-      log 'Exiting...'
-      @shutdown = true
+    def shutdown(force = false)
+      log "Exiting..."
+      if force
+        shutdown_child(true)
+      elsif !shutting_down?
+        shutdown_child
+      end
     end
 
     # Kill the child and shutdown immediately.
@@ -425,47 +417,34 @@ module Resque
       else
         kill_child
       end
+
+      @shutting_down = true
     end
 
-    # Should this worker shutdown as soon as current job is finished?
-    def shutdown?
-      @shutdown
+    def shutting_down?
+      !!@shutting_down
     end
 
-    # Kills the forked child immediately, without remorse. The job it
-    # is processing will not be completed.
-    def kill_child
-      if @child
-        log! "Killing child at #{@child}"
-        if `ps -o pid,state -p #{@child}`
-          Process.kill("KILL", @child) rescue nil
-        else
-          log! "Child #{@child} not found, restarting."
-          shutdown
-        end
-      end
-    end
-
-    # Kills the forked child immediately with minimal remorse. The job it
-    # is processing will not be completed. Send the child a TERM signal,
-    # wait 5 seconds, and then a KILL signal if it has not quit
-    def new_kill_child
-      if @child
-        unless Process.waitpid(@child, Process::WNOHANG)
-          log! "Sending TERM signal to child #{@child}"
-          Process.kill("TERM", @child)
-          (term_timeout.to_f * 10).round.times do |i|
-            sleep(0.1)
-            return if Process.waitpid(@child, Process::WNOHANG)
-          end
+    def shutdown_child(force = false)
+      if @child && !Process.waitpid(@child, Process::WNOHANG)
+        if force
           log! "Sending KILL signal to child #{@child}"
+
           Process.kill("KILL", @child)
-        else
-          log! "Child #{@child} already quit."
+        elsif !shutting_down_child?
+          log! "Sending TERM signal to child #{@child}"
+
+          Process.kill("TERM", @child)
         end
+
+        @shutting_down_child = true
       end
     rescue SystemCallError
       log! "Child #{@child} already quit and reaped."
+    end
+
+    def shutting_down_child?
+      !!@shutting_down_child
     end
 
     # are we paused?
@@ -504,9 +483,9 @@ module Resque
         worker_queues = worker_queues_raw.split(",")
         unless @queues.include?("*") || (worker_queues.to_set == @queues.to_set)
           # If the worker we are trying to prune does not belong to the queues
-          # we are listening to, we should not touch it. 
+          # we are listening to, we should not touch it.
           # Attempt to prune a worker from different queues may easily result in
-          # an unknown class exception, since that worker could easily be even 
+          # an unknown class exception, since that worker could easily be even
           # written in different language.
           next
         end
@@ -547,7 +526,8 @@ module Resque
         # Ensure the proper worker is attached to this job, even if
         # it's not the precise instance that died.
         job.worker = self
-        job.fail(exception || DirtyExit.new)
+
+        job.fail(exception || TermException.new("SIGTERM"))
       end
 
       redis.pipelined do

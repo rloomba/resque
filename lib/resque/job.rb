@@ -290,11 +290,18 @@ module Resque
     # the Failure module.
     def fail(exception)
       run_failure_hooks(exception)
-      Failure.create \
-        :payload   => payload,
-        :exception => exception,
-        :worker    => worker,
-        :queue     => queue
+
+      failure_handled = exception.is_a?(TermException) &&
+        (payload_class.respond_to?(:on_failure) ||
+         payload_class.respond_to?(:on_failure_retry))
+
+      unless failure_handled
+        Failure.create \
+          :payload   => payload,
+          :exception => exception,
+          :worker    => worker,
+          :queue     => queue
+      end
     end
 
     # Creates an identical job, essentially placing this job back on
